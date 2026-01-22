@@ -1,0 +1,8 @@
+{
+  "name": "SokoMetrics",
+  "description": "Regional price intelligence platform for East Africa focusing on construction and agricultural inputs.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ]
+}
