@@ -2,7 +2,7 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { User, Submission, Category, StockStatus, SubmissionStatus, ContributorType, SupplierType } from '../types';
 import { PRODUCT_HIERARCHY, COUNTRY_CURRENCY, REGIONS, MOCK_REWARDS, MOCK_WEEKLY_LEADERBOARD, CURRENCIES } from '../constants';
-import { formatCurrency, getCurrentRank, getNextRank, calculateDistance, POINT_VALUES, FX_RATES, RANKS } from '../utils';
+import { formatCurrency, getCurrentRank, getNextRank, calculateDistance, POINT_VALUES, FX_RATES, RANKS, calculateMedian } from '../utils';
 
 interface Props {
   user: User;
@@ -98,7 +98,7 @@ const ContributorPortal: React.FC<Props> = ({ user, submissions, onSubmit, onUpd
       </div>
 
       <div className="pb-12">
-        {activeTab === 'submit' && <SubmissionForm onSubmit={onSubmit} user={user} />}
+        {activeTab === 'submit' && <SubmissionForm onSubmit={onSubmit} user={user} submissions={submissions} />}
         {activeTab === 'discovery' && <NearbySearch submissions={submissions} />}
         {activeTab === 'history' && <HistoryList subs={userSubs} />}
         {activeTab === 'rewards' && <RewardsSection userPoints={user.points} />}
@@ -382,10 +382,17 @@ const EarnRule: React.FC<{ label: string, pts: number, icon: string }> = ({ labe
     <p className="text-xl font-black text-indigo-200">+{pts}</p>
   </div>
 );
+interface SubmissionFormProps {
+  onSubmit: (sub: Submission) => void;
+  user: User;
+  submissions?: Submission[];
+}
 
-const SubmissionForm: React.FC<{ onSubmit: (sub: Submission) => void, user: User }> = ({ onSubmit, user }) => {
+const SubmissionForm: React.FC<SubmissionFormProps> = ({ onSubmit, user, submissions = [] }) => {
   const [step, setStep] = useState(1);
   const [gpsLoading, setGpsLoading] = useState(false);
+  const [locationWarning, setLocationWarning] = useState(false);
+  const [currencyError, setCurrencyError] = useState<string>('');
 
   const [form, setForm] = useState<any>({
     category: Category.CONSTRUCTION,
@@ -415,9 +422,16 @@ const SubmissionForm: React.FC<{ onSubmit: (sub: Submission) => void, user: User
       navigator.geolocation.getCurrentPosition(
         (pos) => {
           setForm(f => ({ ...f, lat: pos.coords.latitude, lng: pos.coords.longitude }));
+          setLocationWarning(false);
           setGpsLoading(false);
         },
-        () => setGpsLoading(false)
+        (error) => {
+          console.warn('Geolocation denied:', error.message);
+          setLocationWarning(true);
+          // Set fallback coordinates
+          setForm(f => ({ ...f, lat: -1.9441, lng: 30.0619 }));
+          setGpsLoading(false);
+        }
       );
     }
   }, []);
@@ -446,7 +460,33 @@ const SubmissionForm: React.FC<{ onSubmit: (sub: Submission) => void, user: User
   };
 
   const handleSubmit = () => {
-    const rate = FX_RATES[form.currency] || 1;
+    // Validate currency exists
+    if (!FX_RATES.hasOwnProperty(form.currency)) {
+      setCurrencyError(`Currency "${form.currency}" not supported. Please select a valid currency.`);
+      return;
+    }
+    setCurrencyError('');
+
+    // Validate coordinates are not null
+    const lat = form.lat ?? -1.9441;
+    const lng = form.lng ?? 30.0619;
+    if (typeof lat !== 'number' || typeof lng !== 'number' || isNaN(lat) || isNaN(lng)) {
+      alert('Invalid location coordinates. Using fallback location.');
+    }
+
+    const rate = FX_RATES[form.currency];
+    const priceLocal = parseFloat(form.price);
+    
+    // Calculate median price for this product type
+    const approvedSubs = submissions.filter(
+      s => s.status === SubmissionStatus.APPROVED && 
+           s.subCategory === form.subCategory &&
+           s.currency === form.currency
+    );
+    const prices = approvedSubs.map(s => s.priceLocal);
+    const median = prices.length > 0 ? calculateMedian(prices) : 0;
+    const deviationFromMedian = median > 0 ? ((priceLocal - median) / median) * 100 : 0;
+
     const submission: Submission = {
       id: 'S' + Math.random().toString().slice(2, 8),
       timestamp: new Date().toISOString(),
@@ -461,9 +501,9 @@ const SubmissionForm: React.FC<{ onSubmit: (sub: Submission) => void, user: User
       spec1: form.spec1,
       spec2: form.spec2,
       unit: form.unit || productMeta?.unit || 'unit',
-      priceLocal: parseFloat(form.price),
+      priceLocal: priceLocal,
       currency: form.currency,
-      priceUSD: parseFloat(form.price) / rate,
+      priceUSD: priceLocal / rate,
       country: form.country,
       city: form.city,
       supplierName: form.supplierName,
@@ -472,13 +512,16 @@ const SubmissionForm: React.FC<{ onSubmit: (sub: Submission) => void, user: User
       status: SubmissionStatus.PENDING,
       hasPhoto: form.hasPhoto,
       notes: form.notes,
-      latitude: form.lat || -1.9441,
-      longitude: form.lng || 30.0619,
+      latitude: lat,
+      longitude: lng,
+      deviationFromMedian: deviationFromMedian,
+      medianReference: median,
       trustWeight: user.trustScore / 100,
       pointsEarned: 0 // Calculated by validator
     };
     onSubmit(submission);
     setStep(1);
+    setCurrencyError('');
     // Reset form after submission
     setForm({
       category: Category.CONSTRUCTION,
@@ -498,8 +541,8 @@ const SubmissionForm: React.FC<{ onSubmit: (sub: Submission) => void, user: User
       stock: StockStatus.IN_STOCK,
       hasPhoto: false,
       notes: '',
-      lat: form.lat,
-      lng: form.lng
+      lat: lat,
+      lng: lng
     });
   };
 
@@ -618,16 +661,24 @@ const SubmissionForm: React.FC<{ onSubmit: (sub: Submission) => void, user: User
 
         {step === 3 && (
           <div className="space-y-6">
+            {currencyError && (
+              <div className="p-4 bg-red-50 border border-red-200 rounded-2xl flex items-start gap-3">
+                <div className="h-6 w-6 rounded-full bg-red-200 text-red-700 flex items-center justify-center flex-shrink-0 text-sm mt-0.5">
+                  <i className="fa-solid fa-circle-xmark"></i>
+                </div>
+                <p className="text-sm font-black text-red-900">{currencyError}</p>
+              </div>
+            )}
             <div className="grid grid-cols-2 gap-4">
                <div>
                   <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Currency</label>
-                  <select value={form.currency} onChange={(e) => setForm({...form, currency: e.target.value})} className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-5 py-4 text-sm font-black">
+                  <select value={form.currency} onChange={(e) => { setForm({...form, currency: e.target.value}); setCurrencyError(''); }} className={`w-full bg-slate-50 border rounded-2xl px-5 py-4 text-sm font-black outline-none focus:ring-2 transition ${currencyError ? 'border-red-300 focus:ring-red-200' : 'border-slate-200 focus:ring-indigo-100'}`}>
                      {CURRENCIES.map(c => <option key={c}>{c}</option>)}
                   </select>
                </div>
                <div>
                   <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Price Local</label>
-                  <input type="number" value={form.price} onChange={(e) => setForm({...form, price: e.target.value})} className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-5 py-4 text-sm font-black outline-none" placeholder="0" />
+                  <input type="number" value={form.price} onChange={(e) => setForm({...form, price: e.target.value})} className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-5 py-4 text-sm font-black outline-none focus:ring-2 focus:ring-indigo-100" placeholder="0" />
                </div>
             </div>
 
@@ -690,13 +741,30 @@ const SubmissionForm: React.FC<{ onSubmit: (sub: Submission) => void, user: User
               </div>
             </div>
 
-            <div className="p-5 bg-slate-50 rounded-2xl border border-slate-100 flex items-center gap-4">
-              <div className={`h-10 w-10 rounded-full flex items-center justify-center text-xl shadow-sm ${form.lat ? 'bg-emerald-100 text-emerald-600' : 'bg-slate-200 text-slate-400 animate-pulse'}`}>
-                <i className={`fa-solid ${form.lat ? 'fa-location-dot' : 'fa-gps-slash'}`}></i>
-              </div>
-              <div>
-                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">GPS Coordinates</p>
-                <p className="text-xs font-bold text-slate-900">{form.lat ? `${form.lat.toFixed(4)}, ${form.lng.toFixed(4)}` : 'Detecting location...'}</p>
+            <div className="space-y-3">
+              {locationWarning && (
+                <div className="p-4 bg-amber-50 border border-amber-200 rounded-2xl flex items-start gap-3">
+                  <div className="h-6 w-6 rounded-full bg-amber-200 text-amber-700 flex items-center justify-center flex-shrink-0 text-sm mt-0.5">
+                    <i className="fa-solid fa-triangle-exclamation"></i>
+                  </div>
+                  <div>
+                    <p className="text-sm font-black text-amber-900">Location Permission Denied</p>
+                    <p className="text-xs text-amber-800 mt-1">Using default location. Enter coordinates manually if available:</p>
+                    <div className="grid grid-cols-2 gap-2 mt-3">
+                      <input type="number" step="0.0001" value={form.lat || ''} onChange={(e) => setForm({...form, lat: e.target.value ? parseFloat(e.target.value) : null})} placeholder="Latitude" className="w-full bg-white border border-amber-100 rounded-lg px-3 py-2 text-[10px] font-bold outline-none focus:ring-2 focus:ring-amber-300" />
+                      <input type="number" step="0.0001" value={form.lng || ''} onChange={(e) => setForm({...form, lng: e.target.value ? parseFloat(e.target.value) : null})} placeholder="Longitude" className="w-full bg-white border border-amber-100 rounded-lg px-3 py-2 text-[10px] font-bold outline-none focus:ring-2 focus:ring-amber-300" />
+                    </div>
+                  </div>
+                </div>
+              )}
+              <div className="p-5 bg-slate-50 rounded-2xl border border-slate-100 flex items-center gap-4">
+                <div className={`h-10 w-10 rounded-full flex items-center justify-center text-xl shadow-sm ${form.lat && !locationWarning ? 'bg-emerald-100 text-emerald-600' : locationWarning ? 'bg-amber-100 text-amber-600' : 'bg-slate-200 text-slate-400 animate-pulse'}`}>
+                  <i className={`fa-solid ${form.lat && !locationWarning ? 'fa-location-dot' : locationWarning ? 'fa-triangle-exclamation' : 'fa-gps-slash'}`}></i>
+                </div>
+                <div>
+                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">GPS Coordinates</p>
+                  <p className="text-xs font-bold text-slate-900">{form.lat ? `${form.lat.toFixed(4)}, ${form.lng?.toFixed(4)}` : 'Detecting location...'}</p>
+                </div>
               </div>
             </div>
 
